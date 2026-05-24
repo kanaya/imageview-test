@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -30,10 +31,23 @@ SUPPORTED_EXTENSIONS = {
 }
 
 WINDOW_NAME = "Image Viewer"
+CIRCLE_RADIUS = 40
+MORPH_KERNEL_SIZE = 3
 HELP_TEXT = (
-    "Controls: Left/Right or n/p = prev/next | +/- or wheel = zoom | "
-    "f = fit | 1 = 100% | o = open | q/Esc = quit"
+    "Controls: click = Laplacian in circle | Left/Right or n/p = prev/next | "
+    "+/- or wheel = zoom | f = fit | 1 = 100% | o = open | q/Esc = quit"
 )
+
+
+@dataclass(frozen=True)
+class DisplayLayout:
+    scale: float
+    offset_x: int
+    offset_y: int
+    display_width: int
+    display_height: int
+    image_width: int
+    image_height: int
 
 
 def normalize_extension(path: Path) -> str:
@@ -97,27 +111,108 @@ def fit_scale(image: np.ndarray, max_width: int, max_height: int) -> float:
     return min(max_width / width, max_height / height, 1.0)
 
 
+def compute_display_layout(
+    image: np.ndarray,
+    scale: float,
+    fit_mode: bool,
+    window_size: tuple[int, int],
+) -> DisplayLayout:
+    height, width = image.shape[:2]
+    if fit_mode:
+        scale = fit_scale(image, window_size[0], window_size[1])
+
+    display_width = max(1, int(round(width * scale)))
+    display_height = max(1, int(round(height * scale)))
+    offset_x = max(0, (window_size[0] - display_width) // 2)
+    offset_y = max(0, (window_size[1] - display_height) // 2)
+    return DisplayLayout(
+        scale=scale,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        display_width=display_width,
+        display_height=display_height,
+        image_width=width,
+        image_height=height,
+    )
+
+
+def window_point_to_image(x: int, y: int, layout: DisplayLayout) -> tuple[int, int] | None:
+    local_x = x - layout.offset_x
+    local_y = y - layout.offset_y
+    if not (0 <= local_x < layout.display_width and 0 <= local_y < layout.display_height):
+        return None
+
+    image_x = int(round(local_x / layout.scale))
+    image_y = int(round(local_y / layout.scale))
+    image_x = max(0, min(layout.image_width - 1, image_x))
+    image_y = max(0, min(layout.image_height - 1, image_y))
+    return image_x, image_y
+
+
+def denoise_laplacian(laplacian_gray: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE),
+    )
+    eroded = cv2.erode(laplacian_gray, kernel)
+    return cv2.dilate(eroded, kernel)
+
+
+def normalize_max_to_255(gray: np.ndarray) -> np.ndarray:
+    max_val = int(gray.max())
+    if max_val <= 0 or max_val == 255:
+        return gray
+    scaled = gray.astype(np.float32) * (255.0 / max_val)
+    return np.clip(scaled, 0, 255).astype(np.uint8)
+
+
+def apply_laplacian_in_circles(
+    image: np.ndarray,
+    centers: list[tuple[int, int]],
+    radius: int = CIRCLE_RADIUS,
+) -> np.ndarray:
+    if not centers:
+        return image.copy()
+
+    display = image.copy()
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=3)
+    laplacian_abs = np.abs(laplacian)
+    laplacian_norm = cv2.normalize(laplacian_abs, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    laplacian_denoised = denoise_laplacian(laplacian_norm)
+    laplacian_denoised = normalize_max_to_255(laplacian_denoised)
+    laplacian_bgr = cv2.cvtColor(laplacian_denoised, cv2.COLOR_GRAY2BGR)
+
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    for center_x, center_y in centers:
+        cv2.circle(mask, (center_x, center_y), radius, 255, -1)
+
+    display[mask == 255] = laplacian_bgr[mask == 255]
+    return display
+
+
 def render_frame(
     image: np.ndarray,
     scale: float,
     fit_mode: bool,
     window_size: tuple[int, int],
-) -> np.ndarray:
-    height, width = image.shape[:2]
-    if fit_mode:
-        scale = fit_scale(image, window_size[0], window_size[1])
+) -> tuple[np.ndarray, DisplayLayout]:
+    layout = compute_display_layout(image, scale, fit_mode, window_size)
 
-    target_width = max(1, int(round(width * scale)))
-    target_height = max(1, int(round(height * scale)))
-
-    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(image, (target_width, target_height), interpolation=interpolation)
+    interpolation = cv2.INTER_AREA if layout.scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(
+        image,
+        (layout.display_width, layout.display_height),
+        interpolation=interpolation,
+    )
 
     canvas = np.full((window_size[1], window_size[0], 3), 32, dtype=np.uint8)
-    offset_x = max(0, (window_size[0] - target_width) // 2)
-    offset_y = max(0, (window_size[1] - target_height) // 2)
-    canvas[offset_y : offset_y + target_height, offset_x : offset_x + target_width] = resized
-    return canvas
+    canvas[
+        layout.offset_y : layout.offset_y + layout.display_height,
+        layout.offset_x : layout.offset_x + layout.display_width,
+    ] = resized
+
+    return canvas, layout
 
 
 def draw_overlay(
@@ -171,7 +266,9 @@ class ImageViewer:
         self.fit_mode = True
         self.images: list[Path] = []
         self.index = 0
-        self.current_image: np.ndarray | None = None
+        self.base_image: np.ndarray | None = None
+        self.circle_marks: dict[str, list[tuple[int, int]]] = {}
+        self.display_layout: DisplayLayout | None = None
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, *self.window_size)
@@ -208,9 +305,9 @@ class ImageViewer:
         image = load_image(path)
         if image is None:
             print(f"Failed to load: {path}", file=sys.stderr)
-            self.current_image = None
+            self.base_image = None
             return
-        self.current_image = image
+        self.base_image = image
         self.fit_mode = True
 
     def _refresh_window_size(self) -> None:
@@ -220,13 +317,21 @@ class ImageViewer:
 
     def _show(self) -> None:
         self._refresh_window_size()
-        if self.current_image is None:
+        if self.base_image is None:
             blank = np.full((self.window_size[1], self.window_size[0], 3), 32, dtype=np.uint8)
             cv2.imshow(WINDOW_NAME, blank)
             return
 
-        height, width = self.current_image.shape[:2]
-        frame = render_frame(self.current_image, self.scale, self.fit_mode, self.window_size)
+        height, width = self.base_image.shape[:2]
+        image_key = str(self.images[self.index])
+        circle_centers = self.circle_marks.get(image_key, [])
+        display_image = apply_laplacian_in_circles(self.base_image, circle_centers)
+        frame, self.display_layout = render_frame(
+            display_image,
+            self.scale,
+            self.fit_mode,
+            self.window_size,
+        )
         overlay = draw_overlay(
             frame,
             self.images[self.index],
@@ -238,10 +343,24 @@ class ImageViewer:
         )
         cv2.imshow(WINDOW_NAME, overlay)
 
-    def _on_mouse(self, event: int, _x: int, _y: int, flags: int, _param: object) -> None:
-        if event == cv2.EVENT_MOUSEWHEEL:
+    def _on_mouse(self, event: int, x: int, y: int, flags: int, _param: object) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._add_circle_at(x, y)
+        elif event == cv2.EVENT_MOUSEWHEEL:
             delta = 1 if flags > 0 else -1
             self._adjust_zoom(0.1 * delta)
+
+    def _add_circle_at(self, x: int, y: int) -> None:
+        if self.base_image is None or self.display_layout is None:
+            return
+
+        image_point = window_point_to_image(x, y, self.display_layout)
+        if image_point is None:
+            return
+
+        image_key = str(self.images[self.index])
+        marks = self.circle_marks.setdefault(image_key, [])
+        marks.append(image_point)
 
     def _adjust_zoom(self, delta: float) -> None:
         self.fit_mode = False
